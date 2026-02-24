@@ -211,7 +211,7 @@ runs:
                 continue;
               }
               if (ch === "?") {
-                out += ".";
+                out += "[^/]";
                 continue;
               }
               if ("\\^$+?.()|{}[]".includes(ch)) {
@@ -220,6 +220,6 @@ runs:
               }
               out += ch;
             }
-            out += "$";
+            out += "[^/]";
             return new RegExp(out);
           }
