@@ -1,0 +1,225 @@
+name: "Delete stale branches"
+description: "Delete branches that match glob patterns and have been inactive for N days."
+author: "shmokmt"
+
+inputs:
+  github_token:
+    description: "GitHub token with contents:write permission."
+    required: false
+    default: ${{ github.token }}
+  include_branches:
+    description: "Glob patterns for target branches to include (newline or comma separated)."
+    required: true
+  inactive_days:
+    description: "Delete branches whose latest commit is older than this many days."
+    required: true
+  exclude_branches:
+    description: "Glob patterns for branches to exclude (newline or comma separated)."
+    required: false
+    default: ""
+  dry_run:
+    description: "If true, do not delete and only report candidates."
+    required: false
+    default: "true"
+
+outputs:
+  summary:
+    description: "JSON summary of skipped/deleted/candidate branches."
+    value: ${{ steps.cleanup.outputs.result }}
+  deleted_count:
+    description: "Number of deleted branches."
+    value: ${{ fromJSON(steps.cleanup.outputs.result).deletedCount }}
+  candidate_count:
+    description: "Number of candidate branches that matched policy."
+    value: ${{ fromJSON(steps.cleanup.outputs.result).candidateCount }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: cleanup
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github_token }}
+        script: |
+          const core = require("@actions/core");
+
+          const rawIncludeBranches = core.getInput("include_branches", { required: true });
+          const rawExcludeBranches = core.getInput("exclude_branches");
+          const inactiveDays = Number(core.getInput("inactive_days", { required: true }));
+          const dryRun = core.getInput("dry_run").toLowerCase() === "true";
+
+          if (!Number.isFinite(inactiveDays) || inactiveDays < 0) {
+            core.setFailed("inactive_days must be a non-negative number.");
+            return;
+          }
+
+          const { owner, repo } = context.repo;
+          const patterns = parsePatterns(rawIncludeBranches);
+          const excludePatterns = parsePatterns(rawExcludeBranches);
+
+          if (patterns.length === 0) {
+            core.setFailed("include_branches must include at least one glob.");
+            return;
+          }
+
+          core.info(`Owner/Repo: ${owner}/${repo}`);
+          core.info(`Branch globs: ${patterns.join(", ")}`);
+          core.info(`Exclude globs: ${excludePatterns.join(", ") || "(none)"}`);
+          core.info(`Inactive days threshold: ${inactiveDays}`);
+          core.info(`Dry run: ${dryRun}`);
+
+          const branches = await github.paginate(github.rest.repos.listBranches, {
+            owner,
+            repo,
+            per_page: 100
+          });
+
+          const repoInfo = await github.rest.repos.get({ owner, repo });
+          const defaultBranch = repoInfo.data.default_branch;
+
+          let candidateCount = 0;
+          let deletedCount = 0;
+          let skippedCount = 0;
+          const candidates = [];
+          const skipped = [];
+
+          const now = Date.now();
+          const thresholdMs = inactiveDays * 24 * 60 * 60 * 1000;
+
+          for (const branch of branches) {
+            const name = branch.name;
+
+            if (name === defaultBranch) {
+              skippedCount += 1;
+              skipped.push({ name, reason: "default branch" });
+              continue;
+            }
+
+            if (branch.protected) {
+              skippedCount += 1;
+              skipped.push({ name, reason: "protected branch" });
+              continue;
+            }
+
+            if (!matchesAny(name, patterns)) {
+              skippedCount += 1;
+              skipped.push({ name, reason: "does not match include globs" });
+              continue;
+            }
+
+            if (excludePatterns.length > 0 && matchesAny(name, excludePatterns)) {
+              skippedCount += 1;
+              skipped.push({ name, reason: "matches exclude globs" });
+              continue;
+            }
+
+            const sha = branch.commit?.sha;
+            if (!sha) {
+              skippedCount += 1;
+              skipped.push({ name, reason: "missing commit sha" });
+              continue;
+            }
+
+            let commitDate;
+            try {
+              const commit = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: sha
+              });
+              commitDate =
+                commit.data.commit?.committer?.date ||
+                commit.data.commit?.author?.date;
+            } catch (error) {
+              skippedCount += 1;
+              skipped.push({ name, reason: `failed to fetch commit (${error.message})` });
+              continue;
+            }
+
+            if (!commitDate) {
+              skippedCount += 1;
+              skipped.push({ name, reason: "missing commit date" });
+              continue;
+            }
+
+            const ageMs = now - new Date(commitDate).getTime();
+            if (ageMs < thresholdMs) {
+              skippedCount += 1;
+              skipped.push({ name, reason: "branch is still active" });
+              continue;
+            }
+
+            candidateCount += 1;
+            candidates.push({ name, lastCommitAt: commitDate, inactiveDays: Math.floor(ageMs / 86400000) });
+            core.info(`Candidate: ${name} (last commit: ${commitDate})`);
+
+            if (dryRun) continue;
+
+            try {
+              await github.rest.git.deleteRef({
+                owner,
+                repo,
+                ref: `heads/${name}`
+              });
+              deletedCount += 1;
+              core.info(`Deleted: ${name}`);
+            } catch (error) {
+              skippedCount += 1;
+              skipped.push({ name, reason: `failed to delete (${error.message})` });
+              core.warning(`Failed to delete ${name}: ${error.message}`);
+            }
+          }
+
+          const summary = {
+            dryRun,
+            inactiveDays,
+            defaultBranch,
+            branchCount: branches.length,
+            candidateCount,
+            deletedCount,
+            skippedCount,
+            candidates,
+            skipped
+          };
+
+          core.info(`Summary: ${JSON.stringify(summary, null, 2)}`);
+          return summary;
+
+          function parsePatterns(value) {
+            return value
+              .split(/[\n,]/)
+              .map((s) => s.trim())
+              .filter(Boolean);
+          }
+
+          function matchesAny(text, globs) {
+            return globs.some((glob) => globToRegExp(glob).test(text));
+          }
+
+          function globToRegExp(glob) {
+            let out = "^";
+            for (let i = 0; i < glob.length; i += 1) {
+              const ch = glob[i];
+              const next = glob[i + 1];
+              if (ch === "*" && next === "*") {
+                out += ".*";
+                i += 1;
+                continue;
+              }
+              if (ch === "*") {
+                out += "[^/]*";
+                continue;
+              }
+              if (ch === "?") {
+                out += ".";
+                continue;
+              }
+              if ("\\^$+?.()|{}[]".includes(ch)) {
+                out += `\\${ch}`;
+                continue;
+              }
+              out += ch;
+            }
+            out += "$";
+            return new RegExp(out);
+          }
